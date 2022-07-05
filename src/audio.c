@@ -20,6 +20,11 @@
 #include "conf.h"
 #include "util.h"
 
+#include <speex/speex_resampler.h>
+
+pthread_mutex_t thr;
+pthread_cond_t cond;
+
 PaUtilRingBuffer g_playback_ringbuffer;
 PaUtilRingBuffer g_capture_ringbuffer;
 
@@ -28,6 +33,13 @@ static pthread_t g_capture_thread;
 
 extern int g_is_quit;
 
+int pFlag = 0;
+int Pcount = 1;
+int P1count = 1;
+
+// #define MIN(x, y) ((x) < (y) ? (x) : (y))
+
+// static float max_amplitude;
 
 static int xrun_recovery(snd_pcm_t *handle, int err)
 {
@@ -121,6 +133,8 @@ void *playback(void *ptr)
     conf_t *conf = (conf_t *)ptr;
     int mmap = 0;
 
+    char *outBuf = NULL;
+
     if ((err = snd_pcm_open(&handle, conf->out_pcm, SND_PCM_STREAM_PLAYBACK, 0)) < 0)
     {
         fprintf(stderr, "cannot open audio device %s (%s)\n",
@@ -179,6 +193,18 @@ void *playback(void *ptr)
     printf("new pipe size: %ld\n", pipe_size);
 
     int wait_us = chunk_size * 1000000 / conf->rate / 4;
+    //resample init 
+    int resampler_err = 0;
+    SpeexResamplerState *play_rs_state = 
+		speex_resampler_init(1,//infile_info.channels,
+							 8000,//infile_info.samplerate,
+							 conf->rate,
+							 10,
+							 &resampler_err);
+
+	speex_resampler_skip_zeros(play_rs_state);
+    outBuf = (char *)malloc(chunk_bytes * 2);
+    
     while (!g_is_quit)
     {
         int count = 0;
@@ -186,6 +212,13 @@ void *playback(void *ptr)
         for (int i = 0; i < 2; i++)
         {
             int result = read(fd, chunk + count, chunk_bytes - count);
+
+            uint32_t in_pro = result;
+            uint32_t out_pro = result;
+
+            err = speex_resampler_process_int(play_rs_state, 0, chunk + count, &in_pro, outBuf, &out_pro);
+            
+            
             if (result < 0)
             {
                 if (errno != EAGAIN)
@@ -197,6 +230,7 @@ void *playback(void *ptr)
             else
             {
                 count += result;
+                // printf("count  %d bytes zero\n", count);
             }
 
             if (count >= chunk_bytes)
@@ -210,6 +244,8 @@ void *playback(void *ptr)
         if (count < chunk_bytes)
         {
             memset(chunk + count, 0, chunk_bytes - count);
+            memset(outBuf, 0, chunk_bytes * 2);
+            
 
             if (count)
             {
@@ -243,10 +279,15 @@ void *playback(void *ptr)
             }
         }
 
-        count = chunk_size;
-        char *data = (char *)chunk;
+        count = chunk_size *2;
+        char *data;
+        // if (conf->bypass){
+        //     memset(outBuf, 0, chunk_bytes * 2);
+        // }
+        data = (char *)outBuf;
         while (count > 0 && !g_is_quit)
         {
+
             ssize_t r;
             if (mmap)
             {
@@ -272,15 +313,33 @@ void *playback(void *ptr)
             }
             if (r > 0)
             {
+                pthread_mutex_lock(&thr);
                 PaUtil_WriteRingBuffer(&g_playback_ringbuffer, data, r);
+
                 count -= r;
                 data += r * frame_bytes;
+                
+                // while(Pcount % 2 != 0) {
+
+                //     pthread_cond_wait(&cond, &thr);
+
+                // }
+                // // // printf("%d ", Pcount++);
+                // Pcount++;
+                // printf("%d ", P1count++);
+
+                pthread_mutex_unlock(&thr);
+                // pthread_cond_signal(&cond);
             }
         }
     }
-
+    
     snd_pcm_close(handle);
+
+    speex_resampler_destroy(play_rs_state);
+    
     free(chunk);
+    free(outBuf);
 
     return NULL;
 }
@@ -316,6 +375,7 @@ void *capture(void *ptr)
 
     while (!g_is_quit)
     {
+
         ssize_t r;
         if (mmap)
         {
@@ -341,12 +401,27 @@ void *capture(void *ptr)
 
         if (r > 0)
         {
+            pthread_mutex_lock(&thr);
+
             ring_buffer_size_t written =
                 PaUtil_WriteRingBuffer(&g_capture_ringbuffer, chunk, r);
+
             if (written < (r))
             {
-                printf("lost %ld frames\n", r - written);
+                printf("lost capture %ld frames\n", r - written);
             }
+
+            // while(Pcount % 2 != 1) {
+
+            //     pthread_cond_wait(&cond, &thr);
+
+            // }
+            // // // printf("%d ", Pcount++);
+            // Pcount++;
+
+            // // printf("%d ", Pcount++);
+            pthread_mutex_unlock(&thr);
+            // pthread_cond_signal(&cond);
         }
     }
 
@@ -398,12 +473,20 @@ int playback_start(conf_t *conf)
         fprintf(stderr, "Initialize ring buffer but element count is not a power of 2.\n");
         exit(1);
     }
-
     pthread_create(&g_playback_thread, NULL, playback, conf);
 
     return 0;
 }
-
+void create_mux()
+{
+    pthread_mutex_init(&thr, 0);
+    pthread_cond_init(&cond, 0);
+}
+void destroy_mux()
+{
+    pthread_mutex_destroy(&thr);
+    pthread_cond_destroy(&cond);
+}
 int capture_stop()
 {
     void *ret = NULL;
@@ -437,11 +520,18 @@ int capture_read(void *buf, size_t frames, int timeout_ms)
 
 int capture_skip(size_t frames)
 {
+    // int16_t *buf1;
     while (PaUtil_GetRingBufferReadAvailable(&g_capture_ringbuffer) < frames)
     {
         usleep(1000);
     }
+
     return PaUtil_AdvanceRingBufferReadIndex(&g_capture_ringbuffer, frames);
+    // PaUtil_ReadRingBuffer(&g_capture_ringbuffer, buf1, frames);
+    // for (int i=0; i<frames;i++){
+    //     printf("error %d\n",buf1[i]);
+    // }
+    // return 0;
 }
 
 int playback_read(void *buf, size_t frames, int timeout_ms)
@@ -454,3 +544,4 @@ int playback_read(void *buf, size_t frames, int timeout_ms)
 
     return PaUtil_ReadRingBuffer(&g_playback_ringbuffer, buf, frames);
 }
+

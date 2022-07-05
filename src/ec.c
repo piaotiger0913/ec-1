@@ -12,9 +12,12 @@
 #include <sys/stat.h>
 
 #include <speex/speex_echo.h>
+#include <speex/speex_resampler.h>
 
 #include "conf.h"
 #include "audio.h"
+
+#include <speex/speex_preprocess.h>
 
 const char *usage =
     "Usage:\n %s [options]\n"
@@ -37,8 +40,12 @@ const char *usage =
 
 volatile int g_is_quit = 0;
 
+extern int pFlag;
+
 extern int fifo_setup(conf_t *conf);
 extern int fifo_write(void *buf, size_t frames);
+
+#define DENOISE_DB (-90)
 
 void int_handler(int signal)
 {
@@ -53,6 +60,7 @@ int main(int argc, char *argv[])
     int16_t *rec = NULL;
     int16_t *far = NULL;
     int16_t *out = NULL;
+    int16_t *re_out = NULL;
     FILE *fp_rec = NULL;
     FILE *fp_far = NULL;
     FILE *fp_out = NULL;
@@ -68,15 +76,14 @@ int main(int argc, char *argv[])
         .playback_fifo = "/tmp/ec.input",
         .out_fifo = "/tmp/ec.output",
         .rate = 16000,
-        .rec_channels = 2,
+        .rec_channels = 1,
         .ref_channels = 1,
-        .out_channels = 2,
+        .out_channels = 1,
         .bits_per_sample = 16,
         .buffer_size = 1024 * 16,
         .playback_fifo_size = 1024 * 4,
-        .filter_length = 4096,
-        .bypass = 1
-    };
+        .filter_length = 8000,
+        .bypass = 0};
 
     while ((opt = getopt(argc, argv, "b:c:d:Df:hi:o:r:s")) != -1)
     {
@@ -161,7 +168,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    int frame_size = config.rate * 10 / 1000; // 10 ms
+    int frame_size = config.rate * 30 / 1000; // 10 ms
 
     if (save_audio)
     {
@@ -179,6 +186,7 @@ int main(int argc, char *argv[])
     rec = (int16_t *)calloc(frame_size * config.rec_channels, sizeof(int16_t));
     far = (int16_t *)calloc(frame_size * config.ref_channels, sizeof(int16_t));
     out = (int16_t *)calloc(frame_size * config.out_channels, sizeof(int16_t));
+    re_out = (int16_t *)calloc(frame_size * config.out_channels, sizeof(int16_t));
 
     if (rec == NULL || far == NULL || out == NULL)
     {
@@ -193,37 +201,82 @@ int main(int argc, char *argv[])
     sig_int_handler.sa_flags = 0;
     sigaction(SIGINT, &sig_int_handler, NULL);
 
-    echo_state = speex_echo_state_init_mc(frame_size,
-                                          config.filter_length,
-                                          config.rec_channels,
-                                          config.ref_channels);
-    speex_echo_ctl(echo_state, SPEEX_ECHO_SET_SAMPLING_RATE, &(config.rate));
+    SpeexPreprocessState *den;
+    int i;
+    float f;
+    den = speex_preprocess_state_init(frame_size, config.rate);
+    i = 1;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_DENOISE, &i);
+    printf("get is noise %d\n", i);
+    int noiseSuppress = DENOISE_DB;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &noiseSuppress); // Set the dB of noise
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_GET_NOISE_SUPPRESS, &noiseSuppress);
+    printf("get noise DB %d\n", noiseSuppress);
+    i = 0;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_AGC, &i);
+    i = 8000;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_AGC_LEVEL, &i);
+    i = 0;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_DEREVERB, &i);
+    f = .0;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_DEREVERB_DECAY, &f);
+    f = .0;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_DEREVERB_LEVEL, &f);
 
+    printf("Initialize the echo cancellation object\n");
+    echo_state = speex_echo_state_init(frame_size, config.filter_length);
+    SpeexPreprocessState *preprocess_state = speex_preprocess_state_init(frame_size, config.rate);
+    speex_echo_ctl(echo_state, SPEEX_ECHO_SET_SAMPLING_RATE, &(config.rate));
+    speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_SET_ECHO_STATE, echo_state);
+    create_mux();
     playback_start(&config);
     capture_start(&config);
     fifo_setup(&config);
 
     printf("Running... Press Ctrl+C to exit\n");
 
-    int timeout = 200 * 1000 * frame_size / config.rate;    // ms
+    int timeout = 200 * 1000 * frame_size / config.rate; // ms
+
+    // resample
+    int resampler_err = 0;
+    SpeexResamplerState *rec_rs_state =
+        speex_resampler_init(1,           // infile_info.channels,
+                             config.rate, // infile_info.samplerate,
+                             8000,
+                             10,
+                             &resampler_err);
 
     // system delay between recording and playback
     printf("skip frames %d\n", capture_skip(delay));
+    printf("filter length %d\n", config.filter_length);
 
     while (!g_is_quit)
     {
-        capture_read(rec, frame_size, timeout);
-        playback_read(far, frame_size, timeout);
+
+        int playNum = playback_read(far, frame_size, timeout);
+
+        int recNum = capture_read(rec, frame_size, timeout);
+
+        if (recNum != playNum)
+        {
+            printf("error: %d, %d\n", playNum, recNum);
+        }
 
         if (!config.bypass)
         {
+            speex_preprocess_run(den, rec);
+            // speex_echo_playback(echo_state, far);
             speex_echo_cancellation(echo_state, rec, far, out);
+            // printf("%d\n", 1);
+            speex_preprocess_run(preprocess_state, out);
+            uint32_t in_pro = frame_size;
+            uint32_t out_pro = frame_size;
+            int err = speex_resampler_process_int(rec_rs_state, 0, out, &in_pro, re_out, &out_pro);
         }
         else
         {
             memcpy(out, rec, frame_size * config.rec_channels * config.bits_per_sample / 8);
         }
-
         if (fp_far)
         {
             fwrite(rec, 2, frame_size * config.rec_channels, fp_rec);
@@ -231,9 +284,13 @@ int main(int argc, char *argv[])
             fwrite(out, 2, frame_size * config.out_channels, fp_out);
         }
 
-        fifo_write(out, frame_size);
+        fifo_write(re_out, frame_size/2);
     }
-
+    destroy_mux();
+    speex_resampler_destroy(rec_rs_state);
+    speex_echo_state_destroy(echo_state);
+    speex_preprocess_state_destroy(preprocess_state);
+    speex_preprocess_state_destroy(den);
     if (fp_far)
     {
         fclose(fp_rec);
@@ -244,6 +301,7 @@ int main(int argc, char *argv[])
     free(rec);
     free(far);
     free(out);
+    free(re_out);
 
     capture_stop();
     playback_stop();

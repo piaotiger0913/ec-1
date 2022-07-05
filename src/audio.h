@@ -13,5 +13,7 @@ int capture_skip(size_t frames);
 int playback_start(conf_t *conf);
 int playback_stop();
 int playback_read(void *buf, size_t frames, int timeout_ms);
+void destroy_mux();
+void create_mux();
 
 #endif // _AUDIO_H_

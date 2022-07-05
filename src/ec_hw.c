@@ -240,10 +240,9 @@ int main(int argc, char *argv[])
     sig_int_handler.sa_flags = 0;
     sigaction(SIGINT, &sig_int_handler, NULL);
 
-    echo_state = speex_echo_state_init_mc(frame_size,
-                                          config.filter_length,
-                                          config.out_channels,
-                                          config.ref_channels);
+    echo_state = speex_echo_state_init(frame_size,
+                                          config.filter_length);
+                                   
     speex_echo_ctl(echo_state, SPEEX_ECHO_SET_SAMPLING_RATE, &(config.rate));
 
     capture_start(&config);
